@@ -1,5 +1,11 @@
 # Ignore files specific to this project
 notes.md
+data/*
+!data/.keep
+models/*
+!models/.keep
+plots/*.csv
+plots/*.eps
 
 
 # Ignore macOS files

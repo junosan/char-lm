@@ -108,43 +108,50 @@ class Layer(with_metaclass(ABCMeta)):
     def pfx(self, s):
         return '%s_%s' % (self.name, s)
 
-    def add_clock_params(self, params, n_out, options):
-        # clk_t : period ~ exp(Uniform(lo, hi))
-        # clk_s : shift  ~ Uniform(0, clk_t)
-        params[self.pfx('clk_t')] = np.exp(np.random.uniform \
-                                            (low  = options['clock_t_exp_lo'],
-                                             high = options['clock_t_exp_hi'],
-                                             size = (n_out))).astype('float32')
-        params[self.pfx('clk_s')] = (params[self.pfx('clk_t')]
-                                     * np.random.uniform(size = (n_out)) \
-                                       .astype('float32'))
-        self.clock_r_on      = options['clock_r_on']
-        self.clock_leak_rate = options['clock_leak_rate']
+    # def add_clock_params(self, params, n_out, options):
+    #     # clk_t : period ~ exp(Uniform(lo, hi))
+    #     # clk_s : shift  ~ Uniform(0, clk_t)
+    #     params[self.pfx('clk_t')] = np.exp(np.random.uniform \
+    #                                         (low  = options['clock_t_exp_lo'],
+    #                                          high = options['clock_t_exp_hi'],
+    #                                          size = (n_out))).astype('float32')
+    #     params[self.pfx('clk_s')] = (params[self.pfx('clk_t')]
+    #                                  * np.random.uniform(size = (n_out)) \
+    #                                    .astype('float32'))
+    #     self.clock_r_on      = options['clock_r_on']
+    #     self.clock_leak_rate = options['clock_leak_rate']
     
-    def setup_clock_graph(self, s_time_tb, t_i, s_i):
-        phi_tbi = tt.mod(s_time_tb[:, :, None] - s_i, t_i) / t_i # broadcasts
-        r_on  = self.clock_r_on
-        alpha = self.clock_leak_rate
-        return tt.switch(phi_tbi < r_on / 2., 2. * phi_tbi / r_on,
-               tt.switch(phi_tbi < r_on     , 2. - 2. * phi_tbi / r_on,
-                                             alpha * phi_tbi))
+    # def setup_clock_graph(self, s_time_tb, t_i, s_i):
+    #     phi_tbi = tt.mod(s_time_tb[:, :, None] - s_i, t_i) / t_i # broadcasts
+    #     r_on  = self.clock_r_on
+    #     alpha = self.clock_leak_rate
+    #     return tt.switch(phi_tbi < r_on / 2., 2. * phi_tbi / r_on,
+    #            tt.switch(phi_tbi < r_on     , 2. - 2. * phi_tbi / r_on,
+    #                                          alpha * phi_tbi))
     
 
 class FCLayer(Layer):
     def add_param(self, params, n_in, n_out, options, **kwargs):
-        # Pass, e.g., act = 'lambda x: tt.tanh(x)' as last argument
+        # Pass, e.g.,
+        #     linear : act = 'lambda x: x'
+        #     tanh   : act = 'lambda x: tt.tanh(x)'
+        #     softmax: act = 'labmda x: tt.nnet.softmax(x)'
         assert callable(eval(kwargs['act']))
         self._act = eval(kwargs['act'])
+        self._softmax = 'softmax' in kwargs['act']
+        self.n_steps = options['window_size']
+        self.n_out   = n_out
 
         params[self.pfx('W')] = unif_weight(options, n_in, n_out)
         params[self.pfx('b')] = unif_weight(options, n_out)
 
-        self.use_weight_norm = options['weight_norm']
+        self.use_weight_norm = options['weight_norm'] and not self._softmax
         if self.use_weight_norm: # scaled to make same norm as unif_weight
             params[self.pfx('wn_Wg')] = (np.euler_gamma * options['init_scale']
                             * np.sqrt(n_in) * np.ones(n_out).astype('float32'))
 
-        self.use_res_gate = options['residual_gate'] and n_in == n_out
+        self.use_res_gate = options['residual_gate'] and n_in == n_out \
+                                                     and not self._softmax
         if self.use_res_gate:
             params[self.pfx('rg_k')] = -1. * np.ones(n_out).astype('float32')
         
@@ -156,7 +163,16 @@ class FCLayer(Layer):
 
         W_ji = weight_norm(v_param('W'), v_param('wn_Wg')) \
                if self.use_weight_norm else v_param('W')
-        h_tbi = self._act(tt.dot(s_below_tbj, W_ji) + v_param('b'))
+        
+        preact = tt.dot(s_below_tbj, W_ji) + v_param('b')
+        if self._softmax:
+            preact = preact.reshape((-1, self.n_out))
+
+        postact = self._act(preact)
+        if self._softmax:
+            postact = postact.reshape((self.n_steps, -1, self.n_out))
+
+        h_tbi = postact
         
         if not self.use_res_gate:
             out_tbi = h_tbi
@@ -166,6 +182,22 @@ class FCLayer(Layer):
 
         return out_tbi, None # no prev_state_update
 
+class OneHotLayer(Layer):
+    def add_param(self, params, n_in, n_out, options, **kwargs):
+        assert n_in == 1 # converts indices to one-hot tensors
+        self.n_steps = options['window_size']
+        self.n_out   = n_out
+
+        return 0 # no state variables
+
+    def setup_graph(self, s_below_tbj, s_time_tb, s_next_prev_idx,
+                    v_params, v_prev_state_bk, v_init_state_k):
+        
+        eye = tt.eye(self.n_out).astype('float32')
+        out_tbi = eye[s_below_tbj.flatten()].reshape((self.n_steps, -1,
+                                                      self.n_out))
+
+        return out_tbi, None # no prev_state_update
 
 class LSTMLayer(Layer):
     def add_param(self, params, n_in, n_out, options, **kwargs):
@@ -174,7 +206,7 @@ class LSTMLayer(Layer):
         self.use_peephole    = options['lstm_peephole']
         self.use_weight_norm = options['weight_norm']
         self.use_layer_norm  = options['layer_norm']
-        self.use_clock       = options['learn_clock_params']
+        # self.use_clock       = options['learn_clock_params']
         self.use_res_gate    = options['residual_gate'] and n_in == n_out
         self.unroll_scan     = options['unroll_scan']
 
@@ -201,8 +233,8 @@ class LSTMLayer(Layer):
             params[self.pfx('ln_s')] = np.ones (9 * n_out).astype('float32')
             params[self.pfx('ln_b')] = np.zeros(9 * n_out).astype('float32')
 
-        if self.use_clock:
-            self.add_clock_params(params, n_out, options)
+        # if self.use_clock:
+        #     self.add_clock_params(params, n_out, options)
 
         if self.use_res_gate:
             params[self.pfx('rg_k')] = -1. * np.ones(n_out).astype('float32')
@@ -236,14 +268,15 @@ class LSTMLayer(Layer):
                  ln_lambda(v_param('ln_s'), v_param('ln_b'), 8, 1 * n_out)]
             non_seqs.extend([v_param('ln_s'), v_param('ln_b')])
 
-        mask_tbi = self.setup_clock_graph \
-                       (s_time_tb, v_param('clk_t'), v_param('clk_s')) \
-                   if self.use_clock else \
-                   tt.ones((self.n_steps, 1, 1), dtype = 'float32')
+        # mask_tbi = self.setup_clock_graph \
+        #                (s_time_tb, v_param('clk_t'), v_param('clk_s')) \
+        #            if self.use_clock else \
+        #            tt.ones((self.n_steps, 1, 1), dtype = 'float32')
         
-        def step(x_b4i, time_b, mask_bi, prev_h_bi, prev_c_bi, *args):
-            prev_h_bi = tt.switch(time_b[:, None] > 0., prev_h_bi, init_h_i)
-            prev_c_bi = tt.switch(time_b[:, None] > 0., prev_c_bi, init_c_i)
+        def step(x_b4i, prev_h_bi, prev_c_bi, *args):
+        # def step(x_b4i, time_b, mask_bi, prev_h_bi, prev_c_bi, *args):
+            # prev_h_bi = tt.switch(time_b[:, None] > 0., prev_h_bi, init_h_i)
+            # prev_c_bi = tt.switch(time_b[:, None] > 0., prev_c_bi, init_c_i)
             
             preact_b4i = n[0](x_b4i) + n[1](tt.dot(prev_h_bi, U_i4i))
 
@@ -254,21 +287,22 @@ class LSTMLayer(Layer):
 
             c_bi = (i_bi * tt.tanh(cut1(preact_b4i, 2, n_out))
                     + f_bi * prev_c_bi)
-            if self.use_clock:
-                c_bi = mask_bi * c_bi + (1. - mask_bi) * prev_c_bi
+            # if self.use_clock:
+            #     c_bi = mask_bi * c_bi + (1. - mask_bi) * prev_c_bi
 
             o_bi = tt.nnet.sigmoid(cut1(preact_b4i, 3, n_out)
                                  + cut0(p_3i, 2, n_out) * c_bi)
             
             h_bi = o_bi * tt.tanh(n[2](c_bi))
-            if self.use_clock:
-                h_bi = mask_bi * h_bi + (1. - mask_bi) * prev_h_bi 
+            # if self.use_clock:
+            #     h_bi = mask_bi * h_bi + (1. - mask_bi) * prev_h_bi 
 
             return h_bi, c_bi
 
         if not self.unroll_scan:
             ((h_tbi, c_tbi), _) = th.scan(step,
-                      sequences     = [x_tb4i, s_time_tb, mask_tbi],
+                      sequences     = [x_tb4i],
+                    #   sequences     = [x_tb4i, s_time_tb, mask_tbi],
                       outputs_info  = [cut1(v_prev_state_bk, 0, n_out),
                                        cut1(v_prev_state_bk, 1, n_out)],
                       non_sequences = non_seqs,
@@ -279,7 +313,8 @@ class LSTMLayer(Layer):
             h_list = [cut1(v_prev_state_bk, 0, n_out)]
             c_list = [cut1(v_prev_state_bk, 1, n_out)]
             for t in range(self.n_steps):
-                h_bi, c_bi = step(x_tb4i[t], s_time_tb[t], mask_tbi[t],
+                h_bi, c_bi = step(x_tb4i[t],
+                # h_bi, c_bi = step(x_tb4i[t], s_time_tb[t], mask_tbi[t],
                                   h_list[-1], c_list[-1], *non_seqs)
                 h_list.append(h_bi)
                 c_list.append(c_bi)
@@ -303,7 +338,7 @@ class GRULayer(Layer):
         self.n_out           = n_out
         self.use_weight_norm = options['weight_norm']
         self.use_layer_norm  = options['layer_norm']
-        self.use_clock       = options['learn_clock_params']
+        # self.use_clock       = options['learn_clock_params']
         self.use_res_gate    = options['residual_gate'] and n_in == n_out
         self.unroll_scan     = options['unroll_scan']
 
@@ -327,8 +362,8 @@ class GRULayer(Layer):
             params[self.pfx('ln_s')] = np.ones (6 * n_out).astype('float32')
             params[self.pfx('ln_b')] = np.zeros(6 * n_out).astype('float32')
 
-        if self.use_clock:
-            self.add_clock_params(params, n_out, options)
+        # if self.use_clock:
+        #     self.add_clock_params(params, n_out, options)
 
         if self.use_res_gate:
             params[self.pfx('rg_k')] = -1. * np.ones(n_out).astype('float32')
@@ -359,13 +394,14 @@ class GRULayer(Layer):
                  ln_lambda(v_param('ln_s'), v_param('ln_b'), 5, 1 * n_out)]
             non_seqs.extend([v_param('ln_s'), v_param('ln_b')])
 
-        mask_tbi = self.setup_clock_graph \
-                       (s_time_tb, v_param('clk_t'), v_param('clk_s')) \
-                   if self.use_clock else \
-                   tt.ones((self.n_steps, 1, 1), dtype = 'float32')
+        # mask_tbi = self.setup_clock_graph \
+        #                (s_time_tb, v_param('clk_t'), v_param('clk_s')) \
+        #            if self.use_clock else \
+        #            tt.ones((self.n_steps, 1, 1), dtype = 'float32')
 
-        def step(x_b3i, time_b, mask_bi, prev_h_bi, *args):
-            prev_h_bi = tt.switch(time_b[:, None] > 0., prev_h_bi, init_h_i)
+        def step(x_b3i, prev_h_bi, *args):
+        # def step(x_b3i, time_b, mask_bi, prev_h_bi, *args):
+            # prev_h_bi = tt.switch(time_b[:, None] > 0., prev_h_bi, init_h_i)
             
             preact_b2i = (n[0](cut1(x_b3i, 0, 2 * n_out))
                         + n[1](tt.dot(prev_h_bi, cut1(U_i3i, 0, 2 * n_out))))
@@ -377,14 +413,15 @@ class GRULayer(Layer):
                    + r_bi * n[3](tt.dot(prev_h_bi, cut1(U_i3i, 2, 1 * n_out))))
 
             h_bi = (1. - u_bi) * prev_h_bi + u_bi * c_bi
-            if self.use_clock:
-                h_bi = mask_bi * h_bi + (1. - mask_bi) * prev_h_bi
+            # if self.use_clock:
+            #     h_bi = mask_bi * h_bi + (1. - mask_bi) * prev_h_bi
 
             return h_bi
 
         if not self.unroll_scan:
             h_tbi, _ = th.scan(step,
-                               sequences     = [x_tb3i, s_time_tb, mask_tbi],
+                               sequences     = [x_tb3i],
+                            #    sequences     = [x_tb3i, s_time_tb, mask_tbi],
                                outputs_info  = v_prev_state_bk,
                                non_sequences = non_seqs,
                                n_steps       = self.n_steps,
@@ -393,7 +430,8 @@ class GRULayer(Layer):
         else:
             h_list = [v_prev_state_bk]
             for t in range(self.n_steps):
-                h_list.append(step(x_tb3i[t], s_time_tb[t], mask_tbi[t],
+                h_list.append(step(x_tb3i[t],
+                # h_list.append(step(x_tb3i[t], s_time_tb[t], mask_tbi[t],
                                    h_list[-1], *non_seqs))
             h_tbi = tt.stack(h_list[1 :], axis = 0)
 

@@ -23,8 +23,9 @@ import cPickle as pk
 from collections import OrderedDict
 import os
 
-from layers import FCLayer, LSTMLayer, GRULayer
-from utils import l2_loss, l1_loss, huber_loss, clip_norm, get_random_string
+from layers import FCLayer, OneHotLayer, LSTMLayer, GRULayer
+from utils import l2_loss, l1_loss, huber_loss, crossentropy_loss, \
+                  clip_norm, get_random_string
 from optimizers import sgd_update, momentum_update, nesterov_update, \
                        vanilla_force, adadelta_force, rmsprop_force, adam_force
 
@@ -109,7 +110,7 @@ class Net():
                 with open(load_from + '/options.pkl', 'rb') as f:
                     loaded_options = pk.load(f)
                     assert self._options == loaded_options, \
-                           'Mismatching options in loaded model'
+                           "Mismatching options in loaded model"
             
             with open(save_to + '/options.pkl', 'wb') as f:
                 pk.dump(self._options, f)
@@ -159,46 +160,40 @@ class Net():
                 self._params[layer.pfx('init')] = np.zeros(state_dim) \
                                                     .astype('float32')
 
+        self._layers = []
 
-        # optional ID embedder
-        if not self._options['learn_id_embedding']:
-            add = 0
-        else:
-            self._id_embedder = FCLayer(self._pfx + 'FC_id_embedder')
-            state_dim = self._id_embedder.add_param \
-                (params  = self._params,
-                 n_in    = self._options['id_count'],
-                 n_out   = self._options['id_embedding_dim'],
-                 options = self._options,
-                 act     = 'lambda x: x')
-            add_states(self._id_embedder, state_dim)
-            add = self._options['id_embedding_dim']
+        # one-hot encoder
+        self._layers.append(OneHotLayer(self._pfx + "OneHot"))
+        self._layers[0].add_param(params  = self._params,
+                                  n_in    = 1,
+                                  n_out   = self._options['input_dim'],
+                                  options = self._options)
 
         # main recurrent layers
         unit = self._options['unit_type'].upper()
-        self._layers = []
         D = self._options['net_depth']
         assert D > 0
-        for i in range(D):
+        for i in range(1, 1 + D):
             self._layers.append(eval(unit + 'Layer') \
                                     (self._pfx + unit + '_' + str(i)))
             state_dim = self._layers[i].add_param \
                 (params  = self._params,
-                 n_in    = add + (self._options['net_width'] if i > 0 else \
-                                  self._options['input_dim']),
+                 n_in    = self._options['net_width'] if i > 1 else \
+                           self._options['input_dim'],
                  n_out   = self._options['net_width'],
                  options = self._options)
             add_states(self._layers[i], state_dim)
         
-        # final FCLayer for dimension compression
-        self._layers.append(FCLayer(self._pfx + 'FC_output'))
-        state_dim = self._layers[D].add_param \
+        # softmax before cross-entropy loss
+        assert self._options['loss_type'] == 'crossentropy'
+        self._layers.append(FCLayer(self._pfx + 'Softmax'))
+        state_dim = self._layers[D + 1].add_param \
                 (params  = self._params,
-                 n_in    = add + self._options['net_width'],
+                 n_in    = self._options['net_width'],
                  n_out   = self._options['target_dim'],
                  options = self._options,
-                 act     = 'lambda x: x')
-        add_states(self._layers[D], state_dim)
+                 act     = 'lambda x: tt.nnet.softmax(x)')
+        add_states(self._layers[D + 1], state_dim)
         
 
         if load_from is not None:
@@ -229,8 +224,8 @@ class Net():
                 [th.shared(v * 0., name = k + '_grad', **self._device) \
                  for k, v in iteritems(self._params)]
 
-    def _setup_forward_graph(self, s_input_tbi, s_time_tb, s_id_idx_tb,
-                                   s_next_prev_idx, v_params, v_prev_states):
+    def _setup_forward_graph(self, s_input_tbi, s_time_tb, s_next_prev_idx,
+                                   v_params, v_prev_states):
         """
         Specify layer connections
         Layers return their internal states for next time step as
@@ -251,36 +246,15 @@ class Net():
             else:
                 return None
 
-        def to_one_hot(x_tb, n_class):
-            # 2-dim -> 3-dim version of tt.extra_ops.to_one_hot
-            x = x_tb.flatten()
-            z = tt.zeros((x.shape[0], n_class), dtype = 'float32')
-            y = tt.set_subtensor(z[tt.arange(x.shape[0]), x], 1.)
-            return tt.reshape(y, (x_tb.shape[0], x_tb.shape[1], n_class))
-
-        if not self._options['learn_id_embedding']:
-            cat = lambda s_below_tbj: s_below_tbj
-        else:
-            s_id_emb_tbi, _ = self._id_embedder.setup_graph \
-                (s_below_tbj     = to_one_hot \
-                                      (s_id_idx_tb, self._options['id_count']),
-                 s_time_tb       = s_time_tb,
-                 s_next_prev_idx = s_next_prev_idx,
-                 v_params        = v_params,
-                 v_prev_state_bk = get_v_prev_state(self._id_embedder),
-                 v_init_state_k  = get_v_init_state(self._id_embedder))
-            cat = lambda s_below_tbj: tt.concatenate([s_below_tbj,
-                                                      s_id_emb_tbi], axis = 2)
-
-        D = self._options['net_depth']
-        s_outputs = [None] * (D + 1)  # (RNN) * D + FC
+        N = len(self._layers)
+        s_outputs = [None] * N
         s_outputs.append(s_input_tbi) # put input at index -1
         prev_state_updates = []
 
         # vertical stack: input -> layer[0] -> ... -> layer[D - 1] -> output
-        for i in range(D + 1):
+        for i in range(N):
             s_outputs[i], update = self._layers[i].setup_graph \
-                (s_below_tbj     = cat(s_outputs[i - 1]),
+                (s_below_tbj     = s_outputs[i - 1],
                  s_time_tb       = s_time_tb,
                  s_next_prev_idx = s_next_prev_idx,
                  v_params        = v_params,
@@ -289,18 +263,16 @@ class Net():
             if update is not None:
                 prev_state_updates.append(update)
         
-        return s_outputs[D], prev_state_updates
+        return s_outputs[N - 1], prev_state_updates
 
     def _setup_inference_graph(self):
         """
         Connect graphs together for inference and store in/out ports & updates
-            inputs  : input, time, id_idx
+            inputs  : input, time
             outputs : output
             updates : prev_states
         """
-        p_input_tbi = tt.ftensor3(name  = 'port_i_input')
-        p_time_tb   = tt.fmatrix (name  = 'port_i_time')
-        p_id_idx_tb = tt.imatrix (name  = 'port_i_id_idx')
+        p_input_tbi = tt.itensor3(name  = 'port_i_input')
         
         # step_size is a compile time constant for inference
         s_next_prev_idx = tt.alloc(np.int32(self._options['step_size'] - 1))
@@ -311,8 +283,7 @@ class Net():
         for s in self._slices:
             s_output_tbi, prev_state_updates = self._setup_forward_graph \
                 (s_input_tbi     = s.apply(p_input_tbi),
-                 s_time_tb       = s.apply(p_time_tb),
-                 s_id_idx_tb     = s.apply(p_id_idx_tb),
+                 s_time_tb       = None,
                  s_next_prev_idx = s.transfer(s_next_prev_idx),
                  v_params        = s.v_params,
                  v_prev_states   = s.v_prev_states)
@@ -322,7 +293,7 @@ class Net():
         # merge outputs from all slices
         p_output_tbi = tt.concatenate(outputs, axis = 1)
 
-        self._prop_i_ports   = [p_input_tbi, p_time_tb, p_id_idx_tb]
+        self._prop_i_ports   = [p_input_tbi]
         self._prop_o_ports   = [p_output_tbi]
 
     def _setup_loss_graph(self, s_output_tbi, s_target_tbi, s_step_size):
@@ -340,8 +311,10 @@ class Net():
         if self._options['loss_type'] == 'huber':
             delta = self._options['huber_delta']
             return huber_loss(s_sliced_output_tbi, s_sliced_target_tbi, delta)
+        if self._options['loss_type'] == 'crossentropy':
+            return crossentropy_loss(s_sliced_output_tbi, s_sliced_target_tbi)
         
-        assert False, 'Invalid loss_type option'
+        assert False, "Invalid loss_type option"
         return tt.alloc(np.float32(0.))
 
     def _setup_grads_graph(self, s_loss, v_wrt):
@@ -396,7 +369,7 @@ class Net():
     def _setup_training_graph(self):
         """
         Connect graphs together for training and store in/out ports & updates
-        (propagation)  inputs  : input, target, time, id_idx, step_size
+        (propagation)  inputs  : input, target, step_size
                        outputs : loss
                        updates : prev_states[, grads]
         (param update) inputs  : lr
@@ -406,10 +379,8 @@ class Net():
                        outputs : None
                        updates : optimizer states
         """
-        p_input_tbi  = tt.ftensor3(name = 'i_port_input')
-        p_target_tbi = tt.ftensor3(name = 'i_port_target')
-        p_time_tb    = tt.fmatrix (name = 'i_port_time')
-        p_id_idx_tb  = tt.imatrix (name = 'i_port_id_idx')
+        p_input_tbi  = tt.itensor3(name = 'i_port_input')
+        p_target_tbi = tt.itensor3(name = 'i_port_target')
         p_step_size  = tt.iscalar (name = 'i_port_step_size')
         p_lr         = tt.fscalar (name = 'i_port_lr')
 
@@ -421,8 +392,7 @@ class Net():
             s_step_size = s.transfer(p_step_size)
             s_output_tbi, prev_state_updates = self._setup_forward_graph \
                 (s_input_tbi     = s.apply(p_input_tbi),
-                 s_time_tb       = s.apply(p_time_tb),
-                 s_id_idx_tb     = s.apply(p_id_idx_tb),
+                 s_time_tb       = None,
                  s_next_prev_idx = s_step_size - 1,
                  v_params        = s.v_params,
                  v_prev_states   = s.v_prev_states)
@@ -452,25 +422,22 @@ class Net():
             self._optim_param_updates += \
                 [(p, p + i) for p, i in zip(s.v_params.values(), s_increments)]
 
-        self._prop_i_ports   = [p_input_tbi, p_target_tbi, p_time_tb,
-                                p_id_idx_tb, p_step_size]
+        self._prop_i_ports   = [p_input_tbi, p_target_tbi, p_step_size]
         self._prop_o_ports   = [p_loss]
         self._update_i_ports = [p_lr]
 
     def compile_f_fwd_propagate(self):
         """
         Compile a callable object of signature
-            (training)  f(input_tbi, target_tbi, time_tb,
-                          id_idx_tb, step_size) -> [loss]
-            (inference) f(input_tbi, time_tb, id_idx_tb) -> [output_tbi]
+            (training)  f(input_tbi, target_tbi, step_size) -> [loss]
+            (inference) f(input_tbi) -> [output_tbi]
         As a side effect, calling it updates
             v_prev_states
         
         - Output is a list of np.ndarray (i.e., 0-th element is np.ndarray)
           whether scalar (loss) or tensor3 (output_tbi)
         """
-        on_unused_input = 'raise' if self._options['learn_id_embedding'] \
-                                  else 'ignore'
+        on_unused_input = 'raise' # 'ignore'
         return th.function(inputs  = self._prop_i_ports,
                            outputs = self._prop_o_ports,
                            updates = self._prev_state_updates,
@@ -479,7 +446,7 @@ class Net():
     def compile_f_fwd_bwd_propagate(self):
         """
         Compile a callable object of signature
-            f(input_tbi, target_tbi, time_tb, id_idx_tb, step_size) -> [loss]
+            f(input_tbi, target_tbi, step_size) -> [loss]
         As a side effect, calling it updates
             v_grads, v_prev_states
         
@@ -487,8 +454,7 @@ class Net():
         - For validation (obtain loss only), call f_fwd_propagate instead
         """
         assert self._is_training
-        on_unused_input = 'raise' if self._options['learn_id_embedding'] \
-                                  else 'ignore'
+        on_unused_input = 'raise' # 'ignore'
         return th.function(inputs  = self._prop_i_ports,
                            outputs = self._prop_o_ports,
                            updates = (self._grad_updates

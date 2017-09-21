@@ -13,21 +13,21 @@
 #   limitations under the License.
 
 """
-Program for training
+Script for training
 
 Use as (for example):
-    DEV="device=cuda0"                      # single GPU
-    DEV="contexts=dev0->cuda0;dev1->cuda1"  # multi GPU (currently incomplete)
-    FLAGS="floatX=float32,"$DEV",gpuarray.preallocate=1,base_compiledir=theano"
+    DEV="device=cuda0"
+    NAME="some_name"
+    WORKSPACE_DIR=path_to_workspace_dir
+    DATA_DIR=path_to_data_dir
+
+    FLAGS=$DEV",floatX=float32,gpuarray.preallocate=1,base_compiledir=theano"
     THEANO_FLAGS=$FLAGS python -u train.py --data_dir=$DATA_DIR \
         --save_to=$WORKSPACE_DIR/workspace_$NAME \
         [--load_from=$WORKSPACE_DIR/workspace_$LOADNAME] [--seed=some_number] \
         | tee -a $WORKSPACE_DIR/$NAME".log"
 
 - Device "cuda$" means $-th GPU
-- Flag contexts can map any number of GPUs to be used for data parallelism
-  (this feature is incomplete until Theano completes implementation 
-   of support for this flag)
 - Flag gpuarray.preallocate reserves given ratio of GPU mem (reduce if needed)
 - Flag base_compiledir directs intermediate files to pwd/theano to avoid
   lock conflicts between multiple training instances (by default ~/.theano)
@@ -40,24 +40,24 @@ from six import iterkeys, itervalues, iteritems
 from collections import OrderedDict
 import argparse
 from net import Net
-from data import build_id_idx, DataIter
+from data import DataIter
 import time
 import numpy as np
 import theano as th
-from subprocess import call
+import os, errno
 import sys
 
 def main():
     options = OrderedDict()
 
-    options['input_dim']          = 44
-    options['target_dim']         = 1
-    options['unit_type']          = 'lstm'     # fc/lstm/gru
+    options['input_dim']          = 27
+    options['target_dim']         = 27
+    options['unit_type']          = 'lstm'         # fc/lstm/gru
     options['lstm_peephole']      = True
-    options['loss_type']          = 'l2'       # l2/l1/huber
-    # options['huber_delta']        = 0.33       # depends on target's scale
-    options['net_width']          = 512
-    options['net_depth']          = 12
+    options['loss_type']          = 'crossentropy' # l2/l1/huber/crossentropy
+    # options['huber_delta']        = 0.33         # depends on target's scale
+    options['net_width']          = 2048
+    options['net_depth']          = 1
     options['batch_size']         = 128
     options['window_size']        = 128
     options['step_size']          = 64
@@ -65,27 +65,20 @@ def main():
     options['init_use_ortho']     = False
     options['weight_norm']        = False
     options['layer_norm']         = False
-    options['residual_gate']      = True
-    options['learn_init_states']  = True
-    options['learn_id_embedding'] = False
-    # options['id_embedding_dim']   = 16
-    options['learn_clock_params'] = False
-    # options['clock_t_exp_lo']     = 1.         # for learn_clock_params
-    # options['clock_t_exp_hi']     = 6.         # for learn_clock_params
-    # options['clock_r_on']         = 0.2        # for learn_clock_params
-    # options['clock_leak_rate']    = 0.001      # for learn_clock_params
-    # options['grad_norm_clip']     = 2.         # comment out to turn off
+    options['residual_gate']      = False
+    options['learn_init_states']  = False
+    # options['grad_norm_clip']     = 2.       # comment out to turn off
     options['update_type']        = 'nesterov' # sgd/momentum/nesterov
     options['update_mu']          = 0.9        # for momentum/nesterov
     options['force_type']         = 'adadelta' # vanilla/adadelta/rmsprop/adam
     options['force_ms_decay']     = 0.99       # for adadelta/rmsprop
     # options['force_adam_b1']      = 0.9
     # options['force_adam_b2']      = 0.999
-    options['frames_per_epoch']   = 8 * 1024 * 1024
+    options['frames_per_epoch']   = 2 * 1024 * 1024
     options['lr_init_val']        = 1e-5
     options['lr_lower_bound']     = 1e-7
     options['lr_decay_rate']      = 0.5
-    options['max_retry']          = 10
+    options['max_retry']          = 5
     options['unroll_scan']        = False      # faster training/slower compile
 
     if options['unroll_scan']:
@@ -103,26 +96,12 @@ def main():
     parser.add_argument('--seed'     , type = int)
     args = parser.parse_args()
 
-    assert 0 == call(str('mkdir -p ' + args.save_to).split())
-    
-    # store mean/whitening matrices from Reshaper (remove if inapplicable)
-    assert 0 == call(str('cp ' + args.data_dir + '/mean.matrix '
-                         + args.save_to).split())
-    assert 0 == call(str('cp ' + args.data_dir + '/whitening.matrix '
-                         + args.save_to).split())
-
-    # store ID count, internal ID order, and number of sequences
-    id_idx = build_id_idx(args.data_dir + '/train.list')
-    options['id_count'] = len(id_idx)
-    with open(args.save_to + '/ids.order', 'w') as f:
-        f.write(';'.join(iterkeys(id_idx))) # code_0;...;code_N-1
-
-    def n_seqs(list_file):
-        with open(list_file) as f:
-            return sum(1 for line in f)
-    
-    n_seqs_train = n_seqs(args.data_dir + '/train.list')
-    n_seqs_dev   = n_seqs(args.data_dir + '/dev.list')
+    # make sure directory args.save_to exists
+    try:
+        os.makedirs(args.save_to)
+    except OSError as exception:
+        if exception.errno != errno.EEXIST:
+            raise
 
     # list of context_name's (THEANO_FLAGS=contexts=... for multi GPU mode)
     c_names = [m.split('->')[0] for m in th.config.contexts.split(';')] \
@@ -133,6 +112,19 @@ def main():
            if args.seed is None else args.seed
     np.random.seed(seed)
 
+    # NOTE: window_size must be the same as that given to Net
+    train_data = DataIter(text_file   = args.data_dir + '/train',
+                          window_size = options['window_size'],
+                          step_size   = options['step_size'],
+                          batch_size  = options['batch_size'])
+    dev_data   = DataIter(text_file  = args.data_dir + '/dev',
+                          window_size = options['window_size'],
+                          step_size   = options['step_size'],
+                          batch_size  = options['batch_size'])
+    test_data  = DataIter(text_file  = args.data_dir + '/test',
+                          window_size = options['window_size'],
+                          step_size   = options['step_size'],
+                          batch_size  = options['batch_size'])
 
     """
     Print summary for logging 
@@ -156,11 +148,10 @@ def main():
     
     print_hline() # -----------------------------------------------------------
     print('Stats')
-    print('    np.random.seed  : ' + str(seed).rjust(10))
-    print('    # of train seqs : ' + str(n_seqs_train).rjust(10))
-    print('    # of dev seqs   : ' + str(n_seqs_dev  ).rjust(10))
-    print('    # of unique IDs : ' + str(options['id_count']).rjust(10))
-    print('    # of weights    : ', end = '')
+    print('    np.random.seed : ' + str(seed).rjust(10))
+    print('    train set size : ' + str(train_data.size()).rjust(10))
+    print('    dev   set size : ' + str(dev_data  .size()).rjust(10))
+    print('    # of weights   : ', end = '')
     net = Net(options, args.save_to, args.load_from, c_names) # takes few secs
     print(str(net.n_weights()).rjust(10))
 
@@ -182,22 +173,7 @@ def main():
     f_initialize_optimizer = net.compile_f_initialize_optimizer()
     print(lapse_from(start))
 
-    # NOTE: window_size must be the same as that given to Net
-    train_data = DataIter(list_file   = args.data_dir + '/train.list',
-                          window_size = options['window_size'],
-                          step_size   = options['step_size'],
-                          batch_size  = options['batch_size'],
-                          input_dim   = options['input_dim'],
-                          target_dim  = options['target_dim'],
-                          id_idx      = id_idx)
-    dev_data   = DataIter(list_file  = args.data_dir + '/dev.list',
-                          window_size = options['window_size'],
-                          step_size   = options['step_size'],
-                          batch_size  = options['batch_size'],
-                          input_dim   = options['input_dim'],
-                          target_dim  = options['target_dim'],
-                          id_idx      = id_idx)
-    
+
     chunk_size = options['step_size'] * options['batch_size']
     trained_frames_per_epoch = \
         (options['frames_per_epoch'] // chunk_size) * chunk_size
@@ -217,19 +193,16 @@ def main():
             step_size = options['window_size']
         frames_per_step = step_size * options['batch_size']
 
-        data_iter.discard_unfinished()
         data_iter.set_step_size(step_size)
 
         loss_sum = 0.
         frames_seen = 0
 
-        for input_tbi, target_tbi, time_tb, id_idx_tb in data_iter:
+        for input_tbi, target_tbi in data_iter:
             if is_training:
-                loss = f_fwd_bwd_propagate(input_tbi, target_tbi, 
-                                           time_tb, id_idx_tb, step_size)
+                loss = f_fwd_bwd_propagate(input_tbi, target_tbi, step_size)
             else:
-                loss = f_fwd_propagate(input_tbi, target_tbi, 
-                                       time_tb, id_idx_tb, step_size)
+                loss = f_fwd_propagate(input_tbi, target_tbi, step_size)
             
             loss_sum    += np.asscalar(loss[0])
             frames_seen += frames_per_step
@@ -286,7 +259,7 @@ def main():
         print('Total trained frames   : ' + str(trained_frames  ).rjust(12))
         print('Total discarded frames : ' + str(discarded_frames).rjust(12))
         print('Train loss : %.6f' % loss_train)
-        print('Eval loss  : %.6f' % loss_cur, end = '')
+        print('Eval  loss : %.6f' % loss_cur, end = '')
 
         if np.isnan(loss_cur):
             loss_cur = np.float32('inf')
@@ -351,8 +324,9 @@ def main():
     print('Best network')
     print('Total trained frames   : ' + str(trained_frames  ).rjust(12))
     print('Total discarded frames : ' + str(discarded_frames).rjust(12))
-    print('[Train set] Loss : %.6f' % run_epoch(train_data, None))
-    print('[ Dev set ] Loss : %.6f' % run_epoch(dev_data  , None))
+    print('[Train] loss : %.6f' % run_epoch(train_data, None))
+    print('[Dev]   loss : %.6f' % run_epoch(dev_data  , None))
+    print('[Test]  loss : %.6f' % run_epoch(test_data , None))
     print('')
 
 if __name__ == '__main__':

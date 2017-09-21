@@ -42,6 +42,12 @@ def huber_loss(s_output_tbi, s_target_tbi, delta):
     return tt.sum(tt.switch(a <= delta, tt.sqr(a) / 2.,
                                         delta * (a - delta / 2.)))
 
+def crossentropy_loss(s_output_tbi, s_target_tbi):
+    # D_err[loss] (to preactivation of softmax) = err
+    # assumes integer indices in i-dim of s_target_tbi, not one-hot encoded
+    n_i = s_output_tbi.shape[2]
+    return tt.sum(tt.nnet.categorical_crossentropy( \
+                    s_output_tbi.reshape((-1, n_i)), s_target_tbi.flatten()))
 
 # Weight initializations
 # Needs modification if used for ReLU or leaky ReLU nonlinearities:
