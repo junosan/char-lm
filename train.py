@@ -18,14 +18,14 @@ Script for training
 Use as (for example):
     DEV="device=cuda0"
     NAME="some_name"
-    WORKSPACE_DIR=path_to_workspace_dir
+    MODEL_DIR=path_to_models_dir
     DATA_DIR=path_to_data_dir
 
     FLAGS=$DEV",floatX=float32,gpuarray.preallocate=1,base_compiledir=theano"
     THEANO_FLAGS=$FLAGS python -u train.py --data_dir=$DATA_DIR \
-        --save_to=$WORKSPACE_DIR/workspace_$NAME \
-        [--load_from=$WORKSPACE_DIR/workspace_$LOADNAME] [--seed=some_number] \
-        | tee -a $WORKSPACE_DIR/$NAME".log"
+        --save_to=$MODEL_DIR/workspace_$NAME \
+        [--load_from=$MODEL_DIR/workspace_$LOADNAME] [--seed=some_number] \
+        | tee -a $MODEL_DIR/$NAME".log"
 
 - Device "cuda$" means $-th GPU
 - Flag gpuarray.preallocate reserves given ratio of GPU mem (reduce if needed)
@@ -52,8 +52,9 @@ def main():
 
     options['input_dim']          = 27
     options['target_dim']         = 27
-    options['unit_type']          = 'lstm'         # fc/lstm/gru
+    options['unit_type']          = 'lstm'         # fc/lstm/gru/rhn
     options['lstm_peephole']      = True
+    # options['rhn_n_layers']       = 10
     options['loss_type']          = 'crossentropy' # l2/l1/huber/crossentropy
     # options['huber_delta']        = 0.33         # depends on target's scale
     options['net_width']          = 2048

@@ -93,7 +93,7 @@ def main():
                         x, y_nw[2], '^-', x, y_nw[3], 'v-')
 
     plt.xlabel('Network width')
-    plt.ylabel('Number of weights')
+    plt.ylabel('Number of weight parameters')
 
     plt.xticks(x, [str(w) for w in widths])
     plt.legend(h_nw, ['Depth ' + str(d) for d in depths])

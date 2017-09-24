@@ -49,12 +49,14 @@ def main():
     ylims.append([1.45, 1.85])
 
     # 1x2048 vs 4x1024
-    name_lists.append(['1x2048',
-                       '4x1024_wn_rg'])
-    legend_lists.append(['1x2048 LSTM',
-                         '4x1024 LSTM WN RG'])
-    fignames.append('exp_arch_lc_extreme')
-    ylims.append([1.35, 1.75])
+    name_lists.append(['1x2700',
+                       '4x1024_wn_rg',
+                       '1x1024_rhn'])
+    legend_lists.append(['1x2700 LSTM',
+                         '4x1024 LSTM WN RG',
+                         '1x1024 10-layer RHN'])
+    fignames.append('exp_arch_lc_final')
+    ylims.append([1.3, 1.7])
     
 
     matplotlib.use('TkAgg')

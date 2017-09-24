@@ -48,6 +48,10 @@ def crossentropy_loss(s_output_tbi, s_target_tbi):
     n_i = s_output_tbi.shape[2]
     return tt.sum(tt.nnet.categorical_crossentropy( \
                     s_output_tbi.reshape((-1, n_i)), s_target_tbi.flatten()))
+    # output = s_output_tbi.reshape((-1, n_i))
+    # return tt.sum(tt.nnet.categorical_crossentropy( \
+    #                 tt.switch(output > 1e-20, output, 1e-20),
+    #                 s_target_tbi.flatten()))
 
 # Weight initializations
 # Needs modification if used for ReLU or leaky ReLU nonlinearities:

@@ -23,7 +23,7 @@ import cPickle as pk
 from collections import OrderedDict
 import os
 
-from layers import FCLayer, OneHotLayer, LSTMLayer, GRULayer
+from layers import FCLayer, OneHotLayer, LSTMLayer, GRULayer, RHNLayer
 from utils import l2_loss, l1_loss, huber_loss, crossentropy_loss, \
                   clip_norm, get_random_string
 from optimizers import sgd_update, momentum_update, nesterov_update, \

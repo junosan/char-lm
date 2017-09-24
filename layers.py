@@ -137,21 +137,23 @@ class FCLayer(Layer):
         #     tanh   : act = 'lambda x: tt.tanh(x)'
         #     softmax: act = 'labmda x: tt.nnet.softmax(x)'
         assert callable(eval(kwargs['act']))
-        self._act = eval(kwargs['act'])
+        self._act     = eval(kwargs['act'])
         self._softmax = 'softmax' in kwargs['act']
-        self.n_steps = options['window_size']
-        self.n_out   = n_out
+        self.n_steps  = options['window_size']
+        self.n_out    = n_out
+        self.use_weight_norm = 'weight_norm' in options and \
+                               options['weight_norm'] and not self._softmax
+        self.use_res_gate    = 'residual_gate' in options and \
+                               options['residual_gate'] and not self._softmax \
+                               and n_in == n_out
 
         params[self.pfx('W')] = unif_weight(options, n_in, n_out)
         params[self.pfx('b')] = unif_weight(options, n_out)
 
-        self.use_weight_norm = options['weight_norm'] and not self._softmax
         if self.use_weight_norm: # scaled to make same norm as unif_weight
             params[self.pfx('wn_Wg')] = (np.euler_gamma * options['init_scale']
                             * np.sqrt(n_in) * np.ones(n_out).astype('float32'))
 
-        self.use_res_gate = options['residual_gate'] and n_in == n_out \
-                                                     and not self._softmax
         if self.use_res_gate:
             params[self.pfx('rg_k')] = -1. * np.ones(n_out).astype('float32')
         
@@ -204,10 +206,13 @@ class LSTMLayer(Layer):
         self.n_steps         = options['window_size']
         self.n_out           = n_out
         self.use_peephole    = options['lstm_peephole']
-        self.use_weight_norm = options['weight_norm']
-        self.use_layer_norm  = options['layer_norm']
+        self.use_weight_norm = 'weight_norm' in options and \
+                               options['weight_norm']
+        self.use_layer_norm  = 'layer_norm' in options and \
+                               options['layer_norm']
         # self.use_clock       = options['learn_clock_params']
-        self.use_res_gate    = options['residual_gate'] and n_in == n_out
+        self.use_res_gate    = 'residual_gate' in options and \
+                               options['residual_gate'] and n_in == n_out
         self.unroll_scan     = options['unroll_scan']
 
         # input to (i, f, c, o) [n_in][4 * n_out]
@@ -336,10 +341,13 @@ class GRULayer(Layer):
     def add_param(self, params, n_in, n_out, options, **kwargs):
         self.n_steps         = options['window_size']
         self.n_out           = n_out
-        self.use_weight_norm = options['weight_norm']
-        self.use_layer_norm  = options['layer_norm']
+        self.use_weight_norm = 'weight_norm' in options and \
+                               options['weight_norm']
+        self.use_layer_norm  = 'layer_norm' in options and \
+                               options['layer_norm']
         # self.use_clock       = options['learn_clock_params']
-        self.use_res_gate    = options['residual_gate'] and n_in == n_out
+        self.use_res_gate    = 'residual_gate' in options and \
+                               options['residual_gate'] and n_in == n_out
         self.unroll_scan     = options['unroll_scan']
 
         # input to (r, u, c) [n_in][3 * n_out]
@@ -442,3 +450,97 @@ class GRULayer(Layer):
             out_tbi = g_i * h_tbi + (1. - g_i) * s_below_tbj
 
         return out_tbi, (v_prev_state_bk, h_tbi[s_next_prev_idx])
+
+# https://arxiv.org/abs/1607.03474
+class RHNLayer(Layer):
+    def add_param(self, params, n_in, n_out, options, **kwargs):
+        self.n_steps         = options['window_size']
+        self.n_out           = n_out
+        self.n_layers        = options['rhn_n_layers']
+        # self.use_clock       = options['learn_clock_params']
+        self.unroll_scan     = options['unroll_scan']
+
+        # input to (h_1, t_1) [n_in][2 * n_out]
+        params[self.pfx('W')] = np.concatenate \
+                                    ([unif_weight(options, n_in, n_out) \
+                                      for _ in range(2)], axis = 1)
+        # bias for (h_l, t_l) [L * 2 * n_out] (even: H, odd: T)
+        # as suggested in arXiv:1607.03474, init T towards closed
+        b_list = []
+        for i in range(self.n_layers * 2):
+            b_list.append(unif_weight(options, n_out) if i % 2 == 0 else
+                          -1. * np.ones(n_out).astype('float32'))
+        params[self.pfx('b')] = np.concatenate(b_list, axis = 0)
+        # hidden to (h_l, t_l) [n_out][L * 2 * n_out]
+        params[self.pfx('R')] = np.concatenate \
+                                ([unif_weight(options, n_out, n_out) \
+                                  for _ in range(self.n_layers * 2)], axis = 1)
+        
+        # if self.use_clock:
+        #     self.add_clock_params(params, n_out, options)
+        
+        return n_out # y
+
+    def setup_graph(self, s_below_tbj, s_time_tb, s_next_prev_idx,
+                    v_params, v_prev_state_bk, v_init_state_k):
+        v_param = lambda name: v_params[self.pfx(name)]
+        n_out   = self.n_out
+
+        W_j2i   = v_param('W')
+        Wx_tb2i = tt.dot(s_below_tbj, W_j2i)
+
+        use_init = v_init_state_k is not None
+        init_y_i = v_init_state_k if use_init else 0.
+
+        R_i2Li = v_param('R')
+        b_2Li  = v_param('b')
+        non_seqs = [init_y_i, R_i2Li, b_2Li]
+        
+        # mask_tbi = self.setup_clock_graph \
+        #                (s_time_tb, v_param('clk_t'), v_param('clk_s')) \
+        #            if self.use_clock else \
+        #            tt.ones((self.n_steps, 1, 1), dtype = 'float32')
+        
+        def step(Wx_b2i, prev_y_bi, *args):
+        # def step(Wx_b2i, time_b, mask_bi, prev_y_bi, *args):
+            # prev_y_bi = tt.switch(time_b[:, None] > 0., prev_y_bi, init_y_i)
+            
+            s_bi = prev_y_bi
+            for l in range(self.n_layers):
+                WHx_bi = cut1(Wx_b2i, 0, n_out) if l == 0 else 0.
+                WTx_bi = cut1(Wx_b2i, 1, n_out) if l == 0 else 0.
+
+                RHs_bi = tt.dot(s_bi, cut1(R_i2Li, l * 2 + 0, n_out))
+                RTs_bi = tt.dot(s_bi, cut1(R_i2Li, l * 2 + 1, n_out))
+
+                h_bi = tt.tanh(WHx_bi + RHs_bi + cut0(b_2Li, l * 2 + 0, n_out))
+                t_bi = tt.nnet.sigmoid \
+                              (WTx_bi + RTs_bi + cut0(b_2Li, l * 2 + 1, n_out))
+
+                s_bi = h_bi * t_bi + s_bi * (1 - t_bi)
+
+            y_bi = s_bi
+            # if self.use_clock:
+            #     y_bi = mask_bi * y_bi + (1. - mask_bi) * prev_y_bi 
+
+            return y_bi
+
+        if not self.unroll_scan:
+            y_tbi, _ = th.scan(step,
+                               sequences     = [Wx_tb2i],
+                             # sequences     = [Wx_tb2i, s_time_tb, mask_tbi],
+                               outputs_info  = [v_prev_state_bk],
+                               non_sequences = non_seqs,
+                               n_steps       = self.n_steps,
+                               name          = self.pfx('scan'),
+                               strict        = True)
+        else:
+            y_list = [v_prev_state_bk]
+            for t in range(self.n_steps):
+                y_bi = step(Wx_tb2i[t],
+                # y_bi = step(Wx_tb2i[t], s_time_tb[t], mask_tbi[t],
+                            y_list[-1], *non_seqs)
+                y_list.append(y_bi)
+            y_tbi = tt.stack(y_list[1 :], axis = 0)
+
+        return y_tbi, (v_prev_state_bk, y_tbi[s_next_prev_idx])
